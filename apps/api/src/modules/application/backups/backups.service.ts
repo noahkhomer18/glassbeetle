@@ -1421,7 +1421,7 @@ export class BackupsService {
    * @returns Absolute path to a writable directory on disk.
    * @throws BadRequestException if the directory is missing, not a directory, or not writable.
    */
-  private resolveTargetDirectory(): string {
+  public resolveTargetDirectory(): string {
     let configuredDir: string | null = null;
     try {
       const policy = this.databaseService.get<{

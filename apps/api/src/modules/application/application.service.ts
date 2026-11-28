@@ -11,6 +11,7 @@ import path from 'node:path';
 import { newId } from '../../common/persistence/identifiers.js';
 import { nowIso } from '../../common/persistence/timestamps.js';
 import { AppConfigService } from '../../config/app-config.service.js';
+import { resolveDefaultDataDir } from '../../config/data-dir.js';
 import { DatabaseService } from '../../database/database.service.js';
 import { FileStorageService } from '../../file-storage/file-storage.service.js';
 import { resolveUserProfileSeed } from '../user/user-profile.seed.js';
@@ -27,6 +28,18 @@ import type {
 export interface ApplicationResetOptions extends ResetApplicationDto {
   /** Explicit confirmation parameter. Must be "true" or "RESET" */
   confirm?: string;
+}
+
+/** Backup archives written by BackupsService, and the temporary file it renames into place. */
+const BACKUP_ARCHIVE_NAME = /^backup-.+\.tar\.gz(?:\.tmp)?$/;
+
+interface BackupArchiveCleanup {
+  /** Where archives are written, read before the backup policy is reset. */
+  directory: string | null;
+  /** Archive names from the `backups` rows being deleted. */
+  fileNames: string[];
+  /** The pre-reset safety backup, which is kept. */
+  keepFileNames: Set<string>;
 }
 
 /**
@@ -127,17 +140,27 @@ export class ApplicationService {
       // 2. Count existing rows for summary reporting
       const counts = this.gatherEntityCounts(keepProviders);
 
-      // 3. Gather stored file references before clearing rows
-      const fileReferences = this.gatherStoredFileReferences(keepBackups);
+      // 3. Gather stored file references before clearing rows. The backup
+      // directory is read here too: clearing resets the policy's target_directory.
+      const fileReferences = this.gatherStoredFileReferences();
+      const backupCleanup = keepBackups
+        ? null
+        : this.prepareBackupArchiveCleanup(preResetBackupId);
 
       // 4. Transactionally clear tables and re-seed singletons
-      this.executeDatabaseClearing(keepProviders, keepBackups);
+      this.executeDatabaseClearing(keepProviders, keepBackups, preResetBackupId);
 
       // 5. Clean up files from storage after database transaction commit
-      const filesDeleted = await this.cleanupStoredFiles(
+      let filesDeleted = await this.cleanupStoredFiles(
         fileReferences,
         keepBackups,
       );
+      let backupArchivesFailed = 0;
+      if (backupCleanup) {
+        const archives = await this.deleteBackupArchives(backupCleanup);
+        filesDeleted += archives.deleted;
+        backupArchivesFailed = archives.failed;
+      }
 
       this.logger.warn(
         `Application reset completed successfully: cleared ${counts.agents} agents, ${counts.chats} chats, ${counts.messages} messages, ${counts.memories} memories, ${counts.projects} projects, ${counts.artifacts} artifacts, ${filesDeleted} files.`,
@@ -165,6 +188,7 @@ export class ApplicationService {
         keepProviders,
         keepBackups,
         preResetBackupId,
+        backupArchivesFailed,
       );
 
       return {
@@ -231,7 +255,7 @@ export class ApplicationService {
   /**
    * Collects all stored file references stored across application tables before deletion.
    */
-  private gatherStoredFileReferences(keepBackups: boolean): string[] {
+  private gatherStoredFileReferences(): string[] {
     const references = new Set<string>();
 
     const collectFromQuery = (sql: string) => {
@@ -253,17 +277,115 @@ export class ApplicationService {
     collectFromQuery('SELECT file_path AS ref FROM artifacts WHERE file_path IS NOT NULL');
     collectFromQuery('SELECT file_path AS ref FROM artifact_versions WHERE file_path IS NOT NULL');
 
-    if (!keepBackups) {
-      collectFromQuery('SELECT file_path AS ref FROM backups WHERE file_path IS NOT NULL');
+    return Array.from(references);
+  }
+
+  /**
+   * Reads where backup archives are written and which ones the `backups` rows
+   * name. `backups.file_path` is a bare file name in that directory, not a
+   * storage reference, so FileStorageService cannot resolve it.
+   */
+  private prepareBackupArchiveCleanup(
+    preResetBackupId: string | null,
+  ): BackupArchiveCleanup {
+    const fileNames: string[] = [];
+    const keepFileNames = new Set<string>();
+    try {
+      const rows = this.databaseService.all<{ id: string; file_path: string | null }>(
+        'SELECT id, file_path FROM backups WHERE file_path IS NOT NULL',
+      );
+      for (const row of rows) {
+        const name = row.file_path?.trim();
+        if (!name) continue;
+        if (row.id === preResetBackupId) {
+          keepFileNames.add(name);
+        } else {
+          fileNames.push(name);
+        }
+      }
+    } catch {
+      // Table might not exist in specialized test fixtures
     }
 
-    return Array.from(references);
+    let directory: string | null = null;
+    try {
+      directory = this.backupsService
+        ? this.backupsService.resolveTargetDirectory()
+        : path.resolve(this.appConfigService?.dataDir ?? resolveDefaultDataDir(), 'backups');
+    } catch {
+      // The message would name the configured directory, which must not be logged
+      this.logger.warn('Could not resolve the backup directory during reset; backup archives may remain on disk.');
+    }
+
+    return { directory, fileNames, keepFileNames };
+  }
+
+  /**
+   * Deletes the archives named by the cleared `backups` rows, then any other
+   * `backup-*.tar.gz` or leftover `.tar.gz.tmp` in the same directory. Nothing
+   * else in the directory is touched.
+   */
+  private async deleteBackupArchives(
+    cleanup: BackupArchiveCleanup,
+  ): Promise<{ deleted: number; failed: number }> {
+    let deleted = 0;
+    let failed = 0;
+    const directory = cleanup.directory;
+    if (!directory) {
+      return { deleted, failed: cleanup.fileNames.length };
+    }
+
+    const attempted = new Set<string>(cleanup.keepFileNames);
+    const remove = async (name: string) => {
+      attempted.add(name);
+      try {
+        await fs.promises.unlink(path.join(directory, name));
+        deleted++;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          failed++;
+        }
+      }
+    };
+
+    for (const name of cleanup.fileNames) {
+      if (attempted.has(name)) continue;
+      // A name that is not a plain file name could point outside the directory
+      if (path.basename(name) !== name || name === '.' || name === '..') {
+        failed++;
+        continue;
+      }
+      await remove(name);
+    }
+
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        failed++;
+      }
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && BACKUP_ARCHIVE_NAME.test(entry.name) && !attempted.has(entry.name)) {
+        await remove(entry.name);
+      }
+    }
+
+    if (failed > 0) {
+      this.logger.warn(`Could not delete ${failed} backup archive file(s) during reset.`);
+    }
+    return { deleted, failed };
   }
 
   /**
    * Executes the database deletions and singleton re-seeding within a single transaction.
    */
-  private executeDatabaseClearing(keepProviders: boolean, keepBackups: boolean): void {
+  private executeDatabaseClearing(
+    keepProviders: boolean,
+    keepBackups: boolean,
+    preResetBackupId: string | null,
+  ): void {
     this.databaseService.transaction(() => {
       // 1. Delete in reverse dependency order respecting foreign keys
       this.databaseService.run('DELETE FROM usage_events');
@@ -286,7 +408,10 @@ export class ApplicationService {
       }
 
       if (!keepBackups) {
-        this.databaseService.run('DELETE FROM backups');
+        // The safety backup this reset just created stays, so it can be restored
+        this.databaseService.run('DELETE FROM backups WHERE id IS NOT ?', [
+          preResetBackupId,
+        ]);
       }
 
       const now = nowIso();
@@ -429,6 +554,7 @@ export class ApplicationService {
     keepProviders: boolean,
     keepBackups: boolean,
     preResetBackupId: string | null,
+    backupArchivesFailed: number,
   ): string[] {
     const steps: string[] = [];
 
@@ -451,6 +577,14 @@ export class ApplicationService {
     if (keepBackups) {
       steps.push(
         'Existing backup archives have been preserved and can be restored at any time via POST /api/v1/application/backups/:backupId/restore.',
+      );
+    } else if (backupArchivesFailed > 0) {
+      steps.push(
+        `${backupArchivesFailed} backup archive file(s) could not be removed from disk.`,
+      );
+    } else if (preResetBackupId) {
+      steps.push(
+        'All backup metadata and physical backup archives except the pre-reset safety backup have been removed from disk.',
       );
     } else {
       steps.push(

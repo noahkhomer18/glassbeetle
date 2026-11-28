@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { newId } from '../src/common/persistence/identifiers.js';
@@ -365,6 +366,184 @@ describe('Application reset endpoint (e2e)', () => {
       expect(count('models')).toBe(1);
       expect(count('provider_credentials')).toBe(1);
       expect(count('agents')).toBe(0);
+    });
+  });
+
+  describe('POST /api/v1/application/reset - keepBackups: false', () => {
+    it('deletes a backup archive from the default backup directory and reports it', async () => {
+      const created = await testApp
+        .request()
+        .post('/api/v1/application/backups')
+        .send({})
+        .expect(201);
+
+      const backupRow = testApp.db.get<{ file_path: string }>(
+        'SELECT file_path FROM backups WHERE id = ?',
+        [created.body.id],
+      );
+      expect(backupRow?.file_path).toBeDefined();
+
+      const archivePath = path.join(
+        testApp.dataDir,
+        'backups',
+        backupRow!.file_path,
+      );
+      expect(fs.existsSync(archivePath)).toBe(true);
+
+      const response = await testApp
+        .request()
+        .post('/api/v1/application/reset')
+        .send({ confirm: 'RESET', keepBackups: false })
+        .expect(200);
+
+      expect(fs.existsSync(archivePath)).toBe(false);
+      expect(count('backups')).toBe(0);
+      expect(response.body.cleared.backupsPreserved).toBe(false);
+      expect(response.body.cleared.filesDeleted).toBeGreaterThanOrEqual(1);
+      expect(response.body.nextSteps).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/backup archives have been removed from disk/i),
+        ]),
+      );
+    });
+
+    it('deletes a backup archive from a custom target directory captured before the policy reset', async () => {
+      const customDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'glassbeetle-reset-custom-backups-'),
+      );
+
+      try {
+        await testApp
+          .request()
+          .put('/api/v1/application/backup-policy')
+          .send({
+            enabled: false,
+            frequency: 'daily',
+            retentionCount: 7,
+            targetDirectory: customDir,
+          })
+          .expect(200);
+
+        const created = await testApp
+          .request()
+          .post('/api/v1/application/backups')
+          .send({})
+          .expect(201);
+
+        const backupRow = testApp.db.get<{ file_path: string }>(
+          'SELECT file_path FROM backups WHERE id = ?',
+          [created.body.id],
+        );
+        expect(backupRow?.file_path).toBeDefined();
+
+        const archivePath = path.join(customDir, backupRow!.file_path);
+        expect(fs.existsSync(archivePath)).toBe(true);
+
+        const response = await testApp
+          .request()
+          .post('/api/v1/application/reset')
+          .send({ confirm: 'RESET', keepBackups: false })
+          .expect(200);
+
+        expect(fs.existsSync(archivePath)).toBe(false);
+        expect(count('backups')).toBe(0);
+        expect(response.body.cleared.backupsPreserved).toBe(false);
+        expect(response.body.cleared.filesDeleted).toBeGreaterThanOrEqual(1);
+        expect(response.body.nextSteps).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(
+              /backup archives have been removed from disk/i,
+            ),
+          ]),
+        );
+
+        const policy = testApp.db.get<{ target_directory: string | null }>(
+          'SELECT target_directory FROM backup_policy WHERE id = 1',
+        );
+        expect(policy?.target_directory).toBeNull();
+      } finally {
+        fs.rmSync(customDir, { recursive: true, force: true });
+      }
+    });
+
+    it('removes stray archives and .tmp files without touching unrelated files in a custom directory', async () => {
+      const customDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'glassbeetle-reset-stray-backups-'),
+      );
+
+      try {
+        await testApp
+          .request()
+          .put('/api/v1/application/backup-policy')
+          .send({
+            enabled: false,
+            frequency: 'daily',
+            retentionCount: 7,
+            targetDirectory: customDir,
+          })
+          .expect(200);
+
+        const strayArchive = path.join(customDir, `backup-${newId()}.tar.gz`);
+        const strayTmp = path.join(customDir, `backup-${newId()}.tar.gz.tmp`);
+        const unrelatedFile = path.join(customDir, 'notes.txt');
+        fs.writeFileSync(strayArchive, 'stray archive');
+        fs.writeFileSync(strayTmp, 'partial archive');
+        fs.writeFileSync(unrelatedFile, 'keep me');
+
+        const response = await testApp
+          .request()
+          .post('/api/v1/application/reset')
+          .send({ confirm: 'RESET', keepBackups: false })
+          .expect(200);
+
+        expect(fs.existsSync(strayArchive)).toBe(false);
+        expect(fs.existsSync(strayTmp)).toBe(false);
+        expect(fs.existsSync(unrelatedFile)).toBe(true);
+        expect(response.body.cleared.filesDeleted).toBeGreaterThanOrEqual(2);
+        expect(response.body.nextSteps).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(
+              /backup archives have been removed from disk/i,
+            ),
+          ]),
+        );
+      } finally {
+        fs.rmSync(customDir, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps the pre-reset safety backup it was asked to create', async () => {
+      const older = await testApp
+        .request()
+        .post('/api/v1/application/backups')
+        .send({})
+        .expect(201);
+      const olderRow = testApp.db.get<{ file_path: string }>(
+        'SELECT file_path FROM backups WHERE id = ?',
+        [older.body.id],
+      );
+      const olderPath = path.join(testApp.dataDir, 'backups', olderRow!.file_path);
+      expect(fs.existsSync(olderPath)).toBe(true);
+
+      const response = await testApp
+        .request()
+        .post('/api/v1/application/reset')
+        .send({ confirm: 'RESET', keepBackups: false, createBackup: true })
+        .expect(200);
+
+      const safetyId = response.body.cleared.preResetBackupId;
+      expect(safetyId).toEqual(expect.any(String));
+      const rows = testApp.db.all<{ id: string; file_path: string }>(
+        'SELECT id, file_path FROM backups',
+      );
+      expect(rows.map((row) => row.id)).toEqual([safetyId]);
+      expect(fs.existsSync(path.join(testApp.dataDir, 'backups', rows[0].file_path))).toBe(true);
+      expect(fs.existsSync(olderPath)).toBe(false);
+      expect(response.body.nextSteps).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/except the pre-reset safety backup/i),
+        ]),
+      );
     });
   });
 
